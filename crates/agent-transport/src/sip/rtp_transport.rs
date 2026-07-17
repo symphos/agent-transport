@@ -150,6 +150,16 @@ impl RtpTransport {
                         bg_silent_ticks = 0;
                         bg_loud_ticks = 0;
                         bg_abs_sum = 0;
+                        // RTCP/stats only — do NOT fall through to the audio
+                        // send below. Falling through transmitted one extra
+                        // audio frame per RTCP interval (+0.4% send rate),
+                        // making downstream jitter buffers (FreeSWITCH) drop a
+                        // frame every ~10s to resync — an RTP timestamp jump
+                        // the far end conceals with PLC (periodic click).
+                        // Measured: 19.89ms/pkt (-0.53%) before, 16 drops/163s
+                        // on the FS→caller leg. Audio cadence must come from
+                        // `iv` ticks alone.
+                        continue;
                     }
                     _ = iv.tick() => {}
                 }
