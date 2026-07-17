@@ -198,6 +198,16 @@ impl RtpTransport {
                     }
                 }
 
+                // Pad partial frames to a full ptime frame. The tick advances the
+                // RTP timestamp by a fixed `spf` regardless of how many samples
+                // were actually drained; sending a short payload makes the next
+                // packet's timestamp jump exceed the payload duration, which
+                // receivers treat as packet loss and conceal (PLC) — audible as
+                // crackle. Partial drains occur at buffer-underrun refill edges
+                // (upstream TTS streaming stalls). Zero-padding keeps every
+                // packet exactly ptime so timestamps and payload always agree.
+                let bg_samples = pad_partial_frame(bg_samples, output_spf);
+
                 if paused.load(Ordering::Acquire) {
                     // Paused: send background audio only (no agent voice).
                     // Record the SAME samples we're putting on the wire so the
@@ -251,6 +261,9 @@ impl RtpTransport {
                 } else {
                     bg_samples
                 };
+                // Same partial-frame padding as bg above (see comment there):
+                // keeps RTP timestamp increments consistent with payload length.
+                let samples = pad_partial_frame(samples, output_spf);
 
                 // Record agent audio — always write to keep in sync with user channel
                 {
@@ -469,10 +482,39 @@ fn notify(p: &Arc<(Mutex<bool>, Condvar)>) {
     p.1.notify_all();
 }
 
+/// Zero-pad a partial frame up to `n` samples (empty stays empty).
+///
+/// The RTP send loop advances the timestamp by a fixed samples-per-frame each
+/// tick; payloads must therefore always span exactly one ptime. Draining an
+/// underrun-recovering buffer can yield fewer samples than a full frame —
+/// padding the tail with silence keeps payload duration and timestamp
+/// increments consistent so receivers don't misdetect packet loss (PLC crackle).
+fn pad_partial_frame(mut samples: Vec<i16>, n: usize) -> Vec<i16> {
+    if !samples.is_empty() && samples.len() < n {
+        samples.resize(n, 0);
+    }
+    samples
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use audio_codec_algorithms::{encode_ulaw, decode_ulaw, encode_alaw, decode_alaw};
+
+    #[test]
+    fn test_pad_partial_frame_pads_short() {
+        let out = pad_partial_frame(vec![1, 2, 3], 8);
+        assert_eq!(out.len(), 8);
+        assert_eq!(&out[..3], &[1, 2, 3]);
+        assert!(out[3..].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn test_pad_partial_frame_keeps_empty_and_full() {
+        assert!(pad_partial_frame(Vec::new(), 8).is_empty()); // 空帧走静音包路径
+        let full: Vec<i16> = (0..8).collect();
+        assert_eq!(pad_partial_frame(full.clone(), 8), full);
+    }
 
     #[test]
     fn test_pcmu_roundtrip() {

@@ -462,7 +462,11 @@ fn new_call_context(
         rtp: None,
         terminated: Arc::new(AtomicBool::new(false)),
         audio_buf: Arc::new(AudioBuffer::with_queue_size(
-            200,
+            // 400ms (was 200): upstream streaming TTS occasionally stalls
+            // mid-utterance (measured 150-700ms); a deeper voice buffer absorbs
+            // most stalls so the RTP loop doesn't underrun (audible gaps).
+            // Barge-in latency is unaffected — interruption flushes the buffer.
+            400,
             output_sample_rate,
             call_id.to_string(),
             event_tx.clone(),
