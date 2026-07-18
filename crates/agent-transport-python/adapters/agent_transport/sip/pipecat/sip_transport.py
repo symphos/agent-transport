@@ -362,14 +362,45 @@ class SipOutputTransport(BaseOutputTransport):
                     frame.sample_rate,
                     frame.num_channels,
                 )
-            except Exception:
-                return False
+            except Exception as push_err:
+                # A rejected push ("buffer full" when the Rust queue is at
+                # capacity) used to drop the frame silently — on the wire
+                # that shreds speech into zero-padded fragments (measured
+                # 2026-07-18: 25-40% zero frames inside TTS windows). The
+                # queue drains 20ms per tick, so back off briefly and retry
+                # before giving the frame up, and always leave a log trail.
+                async_id = None
+                for _ in range(3):
+                    await asyncio.sleep(0.06)
+                    try:
+                        async_id = self._ep.send_audio_async(
+                            self._cid,
+                            frame.audio,
+                            frame.sample_rate,
+                            frame.num_channels,
+                        )
+                        break
+                    except Exception:
+                        continue
+                if async_id is None:
+                    logger.warning(
+                        "write_audio_frame dropped after retries cid={} err={}",
+                        cid,
+                        push_err,
+                    )
+                    return False
             try:
                 ev = await queue.wait_for(
                     lambda e: e.get("async_id") == async_id,
                     timeout=self._wait_timeout,
                 )
             except asyncio.TimeoutError:
+                logger.warning(
+                    "write_audio_frame completion timeout cid={} async_id={} waited={}s",
+                    cid,
+                    async_id,
+                    self._wait_timeout,
+                )
                 return False
         finally:
             self._transport._events.unsubscribe(queue)
