@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use beep_detector::{BeepDetector, BeepDetectorConfig};
 use rsip::message::HasHeaders;
@@ -306,17 +306,42 @@ fn spawn_dialog_watcher(
                 }
                 ds = dr.recv() => {
                     let Some(ds) = ds else { break; };
-                    if let DialogState::Terminated(_, reason) = ds {
-                        let side = classify_termination(&reason, direction);
-                        info!("Call {} terminated {}: {:?}", call_id, side, reason);
-                        // Two-state transition: mark terminated + cancel
-                        // RTP/dialog tasks + emit CallTerminated, but DO NOT
-                        // remove from the HashMap. Python's `hangup(call_id)`
-                        // (called after `_run_call.finally` runs
-                        // `session.aclose()`) is the canonical release.
-                        terminate_sip_call(&call_id, &st, &etx, format!("{:?}", reason));
-                        cc.cancel();
-                        break;
+                    match ds {
+                        // Session refresh (re-INVITE/UPDATE) routed here by the
+                        // dialog layer: answer 200 with our current local SDP —
+                        // session unchanged. Deliberately no Session-Expires in
+                        // the 2xx: per RFC 4028 §9 that deactivates the timer,
+                        // so the peer stops re-testing us every interval.
+                        DialogState::Updated(_, req, handle) => {
+                            let sdp = {
+                                let s = st.lock_or_recover();
+                                s.calls.get(&call_id).and_then(|c| c.local_sdp.clone())
+                            };
+                            let (headers, body) = match sdp {
+                                Some(s) => (
+                                    Some(vec![rsip::Header::ContentType("application/sdp".into())]),
+                                    Some(s.into_bytes()),
+                                ),
+                                None => (None, None),
+                            };
+                            match handle.respond(rsip::StatusCode::OK, headers, body).await {
+                                Ok(()) => info!("Call {} answered in-dialog {} (session refresh)", call_id, req.method),
+                                Err(e) => warn!("Call {} failed to answer in-dialog {}: {}", call_id, req.method, e),
+                            }
+                        }
+                        DialogState::Terminated(_, reason) => {
+                            let side = classify_termination(&reason, direction);
+                            info!("Call {} terminated {}: {:?}", call_id, side, reason);
+                            // Two-state transition: mark terminated + cancel
+                            // RTP/dialog tasks + emit CallTerminated, but DO NOT
+                            // remove from the HashMap. Python's `hangup(call_id)`
+                            // (called after `_run_call.finally` runs
+                            // `session.aclose()`) is the canonical release.
+                            terminate_sip_call(&call_id, &st, &etx, format!("{:?}", reason));
+                            cc.cancel();
+                            break;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -494,6 +519,48 @@ fn new_call_context(
     (ctx, session)
 }
 
+/// Whether a request carries a To tag — i.e. it targets an established dialog
+/// (re-INVITE / UPDATE / …) rather than forming a new one. Dialog-forming
+/// INVITEs have no To tag (RFC 3261 §12.2.2).
+fn has_established_dialog_tag(req: &rsip::Request) -> bool {
+    req.to_header()
+        .ok()
+        .and_then(|h| h.tag().ok().flatten())
+        .is_some()
+}
+
+#[cfg(test)]
+mod reinvite_dispatch_tests {
+    use super::*;
+    use rsip::headers::UntypedHeader;
+
+    fn invite_with_to(to: &str) -> rsip::Request {
+        rsip::Request {
+            method: rsip::Method::Invite,
+            uri: rsip::Uri::try_from("sip:bot@10.0.0.1:5060").unwrap(),
+            headers: vec![
+                rsip::headers::From::new("\"testcaller\" <sip:testcaller@10.0.0.2>;tag=0D0t2D2DUjecQ").into(),
+                rsip::headers::To::new(to).into(),
+                rsip::headers::CallId::new("abc123@10.0.0.2").into(),
+                rsip::headers::CSeq::new("2 INVITE").into(),
+            ]
+            .into(),
+            version: rsip::Version::V2,
+            body: Default::default(),
+        }
+    }
+
+    #[test]
+    fn dialog_forming_invite_has_no_to_tag() {
+        assert!(!has_established_dialog_tag(&invite_with_to("<sip:bot@10.0.0.1>")));
+    }
+
+    #[test]
+    fn session_refresh_reinvite_has_to_tag() {
+        assert!(has_established_dialog_tag(&invite_with_to("<sip:bot@10.0.0.1>;tag=g9hR4bKlocal")));
+    }
+}
+
 fn extract_x_headers(resp: &rsip::Response, session: &mut CallSession) {
     for h in resp.headers().iter() { if let rsip::Header::Other(n, v) = h { if n.starts_with("X-") || n.starts_with("x-") { session.extra_headers.insert(n.clone(), v.clone()); } } }
     if session.call_uuid.is_none() { session.call_uuid = session.extra_headers.get("X-CallUUID").or(session.extra_headers.get("X-Plivo-CallUUID")).cloned(); }
@@ -599,13 +666,27 @@ impl SipEndpoint {
                         }
                         msg = rx.recv() => {
                             let Some(mut tx) = msg else { break; };
-                            if tx.original.method == rsip::Method::Invite {
-                                handle_incoming(&dl2, &st2, &etx3, tx, cc4.clone(), cfg2.clone()).await;
-                            } else if let Some(dialog) = dl2.match_dialog(&tx) {
+                            // Dialog matching MUST run before the new-call check.
+                            // A session-refresh re-INVITE (RFC 4028 — FreeSWITCH
+                            // fires one ~60s into the call) arrives with the
+                            // established dialog's To tag; dispatching it to
+                            // handle_incoming answers with a fresh To tag, the
+                            // peer sees a broken dialog and tears down the live
+                            // call (observed: every call died at ~60s).
+                            if let Some(dialog) = dl2.match_dialog(&tx) {
                                 match dialog {
                                     rsipstack::dialog::dialog::Dialog::ServerInvite(mut d) => { let _ = d.handle(&mut tx).await; }
                                     rsipstack::dialog::dialog::Dialog::ClientInvite(mut d) => { let _ = d.handle(&mut tx).await; }
                                     _ => {}
+                                }
+                            } else if tx.original.method == rsip::Method::Invite {
+                                if has_established_dialog_tag(&tx.original) {
+                                    // In-dialog INVITE for a dialog we no longer
+                                    // hold — RFC 3261 §12.2.2 says 481, never a
+                                    // new call.
+                                    let _ = tx.reply(rsip::StatusCode::CallTransactionDoesNotExist).await;
+                                } else {
+                                    handle_incoming(&dl2, &st2, &etx3, tx, cc4.clone(), cfg2.clone()).await;
                                 }
                             }
                         }
