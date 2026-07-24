@@ -26,6 +26,7 @@ Pipecat's BaseOutputTransport MediaSender infrastructure.
 import asyncio
 import json
 
+from collections import deque
 from typing import Any, Dict, Optional
 
 from loguru import logger
@@ -37,9 +38,10 @@ from agent_transport._ffi_queue import GLOBAL_DICT
 try:
     from pipecat.audio.dtmf.types import KeypadEntry
     from pipecat.frames.frames import (
+        BotStartedSpeakingFrame, BotStoppedSpeakingFrame,
         CancelFrame, EndFrame, Frame, InputAudioRawFrame,
         InputDTMFFrame, InterruptionFrame, OutputAudioRawFrame,
-        StartFrame,
+        StartFrame, TTSAudioRawFrame, TTSStoppedFrame,
     )
     from pipecat.processors.frame_processor import FrameDirection
     from pipecat.transports.base_input import BaseInputTransport
@@ -47,6 +49,101 @@ try:
     from pipecat.transports.base_transport import BaseTransport, TransportParams
 except ImportError:
     raise ImportError("pipecat-ai is required: pip install pipecat-ai")
+
+
+# ─── Playback ownership ─────────────────────────────────────────────────────
+
+
+class PlaybackOwnershipStamper:
+    """把 TTS 音頻幀攜帶的所有權按播放周期復制到 BotStarted/BotStopped。
+
+    上游契約(xbot DLG-029):TTS 側給同一合成 context 的每個
+    ``TTSAudioRawFrame`` 蓋 ``audio_ownership_version`` / ``context_id`` /
+    ``turn_id``(系統播報無 turn_id)。
+
+    對位原理 —— 到達流周期邊界重建:MediaSender 的播放周期由 sink 隊列
+    中的音頻段與 ``TTSStoppedFrame`` 的順序決定,而 sink 順序 == 幀到達
+    輸出傳輸(process_frame)的順序。因此在到達流上,「每個 Stopped 邊界
+    之後的第一個音頻幀」恰好對應一個播放周期的開端 —— 按此登記每周期
+    一條快照,天然覆蓋 vendor 每句 yield 一個 Stopped(同 context 多周期)
+    的形態,對齊的是 MediaSender 的真實周期結構,不是每 context 一條的
+    臆想契約。
+
+    覆核定下的三條防線:
+    - 斷流恢復免疫:pipecat 在 sink 空置 3s 後會補發 Stopped(內部產生,
+      不經到達流),恢復時同 context 二次 Started。此時 sink 已排空,
+      pending 必為空 —— pending 空的 Started 沿用上一周期身份,不彈錯
+      後續快照。
+    - 無章佔位:不帶 ownership 版本的音頻同樣開周期,登記空佔位,
+      防止旁路音頻偷走後續 context 的身份(當前管線無此類幀,防禦性)。
+    - 溢出中毒:pending 超限說明周期事件缺失,丟任何一端都會鏈式錯位
+      —— 整隊清空並停止蓋章(退化為 legacy 裸幀),直到下一次打斷重新
+      同步。寧可缺身份,不可錯身份。
+    """
+
+    _KEYS = ("audio_ownership_version", "context_id", "turn_id")
+    _MAX_PENDING = 8
+
+    def __init__(self) -> None:
+        self._pending: deque[dict] = deque()
+        self._cycle: Optional[dict] = None
+        self._cycle_open = False
+        # 到達流上的「音頻段」開關:Stopped 邊界復位;段內後續幀不重複登記。
+        self._arrival_run_open = False
+        self._poisoned = False
+
+    def _register(self, snapshot: dict) -> None:
+        self._arrival_run_open = True
+        if self._poisoned:
+            return
+        if len(self._pending) >= self._MAX_PENDING:
+            self._pending.clear()
+            self._poisoned = True
+            logger.warning(
+                "PlaybackOwnershipStamper pending overflow — poisoned until next "
+                "interruption (playback events stay unstamped rather than misaligned)"
+            )
+            return
+        self._pending.append(snapshot)
+
+    def observe_audio_frame(self, frame: Frame) -> None:
+        if self._arrival_run_open:
+            return
+        metadata = getattr(frame, "metadata", None) or {}
+        if metadata.get("audio_ownership_version") is None:
+            self._register({})
+            return
+        self._register({key: metadata[key] for key in self._KEYS if key in metadata})
+
+    def observe_stop_frame(self) -> None:
+        """到達流上的 TTSStoppedFrame = 一個播放周期邊界。
+
+        雙 stop(vendor early-return)在此天然無害:第二個邊界上開關已
+        復位,不產生空周期。"""
+        self._arrival_run_open = False
+
+    def observe_interruption(self) -> None:
+        self._pending.clear()
+        self._cycle = None
+        self._cycle_open = False
+        self._arrival_run_open = False
+        self._poisoned = False
+
+    def stamp(self, frame: Frame) -> None:
+        if isinstance(frame, BotStartedSpeakingFrame):
+            if not self._cycle_open:
+                self._cycle_open = True
+                if self._pending:
+                    self._cycle = self._pending.popleft()
+                # pending 空 = 同 context 斷流恢復(3s fallback 補停後同段
+                # 音頻續播)—— 沿用上一周期身份;若上一周期本就是無章
+                # 佔位,沿用結果仍是不蓋章,自洽。
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            # 周期關閉後保留快照:同一事件成對推兩幀(下行+上行),
+            # 第二幀仍需蓋章;下一次周期開啟時整體替換。
+            self._cycle_open = False
+        if self._cycle:
+            frame.metadata.update(self._cycle)
 
 
 # ─── Input Transport ────────────────────────────────────────────────────────
@@ -300,6 +397,8 @@ class SipOutputTransport(BaseOutputTransport):
         self._cid = session_id
         self._transport = transport
         self._started = False
+        # 播放邊界所有權復制(xbot DLG-029 契約的傳輸側半邊)。
+        self._playback_ownership = PlaybackOwnershipStamper()
         # FfiQueue lives on self._transport — InputTransport pumps,
         # OutputTransport subscribes per-frame. Imported here to avoid
         # circular imports during module-load time.
@@ -457,7 +556,33 @@ class SipOutputTransport(BaseOutputTransport):
         """
         if isinstance(frame, InterruptionFrame):
             self._ep.clear_buffer(self._cid)
+            # 被沖掉的音頻不會再播:待播所有權快照與 Rust 緩衝同步清空,
+            # 否則殘留身份會錯配到下一次播放事件。
+            self._playback_ownership.observe_interruption()
+        elif (
+            isinstance(frame, TTSAudioRawFrame)
+            and direction == FrameDirection.DOWNSTREAM
+        ):
+            self._playback_ownership.observe_audio_frame(frame)
+        elif (
+            isinstance(frame, TTSStoppedFrame)
+            and direction == FrameDirection.DOWNSTREAM
+        ):
+            self._playback_ownership.observe_stop_frame()
         await super().process_frame(frame, direction)
+
+    async def push_frame(
+        self,
+        frame: Frame,
+        direction: FrameDirection = FrameDirection.DOWNSTREAM,
+    ):
+        """MediaSender 經此推送成對的 BotStarted/BotStopped(裸幀、無
+        metadata)—— 在唯一出口把當前播放周期的所有權復制上去,下游
+        (xbot latency tap)按 turn_id/context_id/audio_ownership_version
+        直接消費,無需任何順序推斷。"""
+        if isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+            self._playback_ownership.stamp(frame)
+        await super().push_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
         # ``hangup`` is idempotent on terminated sessions; on Active it
