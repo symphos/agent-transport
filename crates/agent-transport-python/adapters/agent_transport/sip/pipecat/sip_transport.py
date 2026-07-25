@@ -162,19 +162,35 @@ class PlaybackOwnershipStamper:
         self._arrival_run_open = False
         self._poisoned = False
 
-    def has_owned_at_or_below(self, cutoff_seq: int) -> bool:
-        """sink 已知內容(當前周期或待播快照)是否含序號 <= cutoff 的音頻。
+    def stale_inventory(self, cutoff_seq: int) -> "tuple[int, bool]":
+        """sink 陳舊內容盤點:(待播陳舊快照數, 當前播放周期是否陳舊有主)。
 
-        無主快照(開場白/結束語/佔位)序號不可解析,永遠回 False —— 系統
-        播報不因輪次接管被誤清。"""
-        snapshots = list(self._pending)
-        if self._cycle:
-            snapshots.append(self._cycle)
-        for snapshot in snapshots:
+        已關閉周期的保留快照不算 sink 內容 —— 它只服務 Stopped 成對幀
+        蓋章;把它計入會在播放早已結束後誤報「仍有陳舊音頻」(10:54 通
+        SIT 每輪誤打 cleared 的根因)。無主快照(開場白/結束語/佔位)
+        序號不可解析,永不算陳舊 —— 系統播報不因輪次接管被誤清。"""
+        pending_stale = 0
+        for snapshot in self._pending:
             seq = _owned_seq(snapshot)
             if seq is not None and seq <= cutoff_seq:
-                return True
-        return False
+                pending_stale += 1
+        active_stale = False
+        if self._cycle_open and self._cycle:
+            seq = _owned_seq(self._cycle)
+            active_stale = seq is not None and seq <= cutoff_seq
+        return pending_stale, active_stale
+
+    def discard_stale_pending(self, cutoff_seq: int) -> None:
+        """清掉序號 <= cutoff 的待播快照(其音頻已被清緩衝,不會再播),
+        並復位到達流段開關,讓新輪次的首幀能重新登記。當前周期保留 ——
+        被切斷的播放以自己的身份閉合(displaced identity),而非無主。"""
+        self._pending = deque(
+            snapshot for snapshot in self._pending
+            if not (
+                (seq := _owned_seq(snapshot)) is not None and seq <= cutoff_seq
+            )
+        )
+        self._arrival_run_open = False
 
     def stamp(self, frame: Frame) -> None:
         if isinstance(frame, BotStartedSpeakingFrame):
@@ -448,8 +464,9 @@ class SipOutputTransport(BaseOutputTransport):
         self._playback_ownership = PlaybackOwnershipStamper()
         # 輪次接管(DLG-030):序號 <= cutoff 的有主音頻失去播放權。單調
         # 遞增,跨打斷保留 —— canonical 序號是通話級的。-1 = 從未收到信號。
+        # 丟幀計數按 owner 累計(OBS-004:效果字段只能由實際丟幀位置產生)。
         self._playback_cutoff = -1
-        self._supersede_dropped: set = set()
+        self._supersede_frames_dropped: dict = {}
         # FfiQueue lives on self._transport — InputTransport pumps,
         # OutputTransport subscribes per-frame. Imported here to avoid
         # circular imports during module-load time.
@@ -611,7 +628,7 @@ class SipOutputTransport(BaseOutputTransport):
             # 被沖掉的音頻不會再播:待播所有權快照與 Rust 緩衝同步清空,
             # 否則殘留身份會錯配到下一次播放事件。
             self._playback_ownership.observe_interruption()
-            self._supersede_dropped.clear()
+            self._supersede_frames_dropped.clear()
         elif metadata.get(_PLAYBACK_CONTROL_VERSION_KEY) is not None:
             self._apply_supersede(metadata)
         elif (
@@ -645,13 +662,33 @@ class SipOutputTransport(BaseOutputTransport):
         if cutoff <= self._playback_cutoff:
             return
         self._playback_cutoff = cutoff
-        if self._playback_ownership.has_owned_at_or_below(cutoff):
-            self._ep.clear_buffer(self._cid)
-            self._playback_ownership.observe_interruption()
-            logger.info(
-                "[Supersede] stale playback cleared cid={} cutoff_turn_seq={}",
-                self._cid, cutoff,
+        new_turn_id = str(control.get("new_turn_id") or "")
+        new_turn_seq = control.get("new_turn_seq")
+        dropped_total = sum(self._supersede_frames_dropped.values())
+        pending_stale, active_stale = self._playback_ownership.stale_inventory(cutoff)
+        if not pending_stale and not active_stale:
+            # OBS-004:沒有實際動作就不得寫 cleared,效果字段全為零值。
+            logger.debug(
+                "[Supersede] supersede_observed cid={} new_turn_id={} new_turn_seq={} "
+                "cutoff_turn_seq={} queued_frames_dropped={} rust_buffer_cleared=false "
+                "active_playback_cancelled=false",
+                self._cid, new_turn_id, new_turn_seq, cutoff, dropped_total,
             )
+            return
+        try:
+            rust_buffer_queued_before = int(self._ep.queued_frames(self._cid))
+        except Exception:
+            rust_buffer_queued_before = -1
+        self._ep.clear_buffer(self._cid)
+        self._playback_ownership.discard_stale_pending(cutoff)
+        logger.info(
+            "[Supersede] supersede_observed cid={} new_turn_id={} new_turn_seq={} "
+            "cutoff_turn_seq={} pending_stale_dropped={} queued_frames_dropped={} "
+            "rust_buffer_queued_before={} rust_buffer_cleared=true "
+            "active_playback_cancelled={}",
+            self._cid, new_turn_id, new_turn_seq, cutoff, pending_stale,
+            dropped_total, rust_buffer_queued_before, active_stale,
+        )
 
     def _is_superseded_audio(self, metadata: dict) -> bool:
         if self._playback_cutoff < 0:
@@ -662,8 +699,9 @@ class SipOutputTransport(BaseOutputTransport):
         if seq is None or seq > self._playback_cutoff:
             return False
         owner = str(metadata.get("turn_id") or f"seq-{seq}")
-        if owner not in self._supersede_dropped:
-            self._supersede_dropped.add(owner)
+        count = self._supersede_frames_dropped.get(owner, 0) + 1
+        self._supersede_frames_dropped[owner] = count
+        if count == 1:
             logger.info(
                 "[Supersede] dropping stale audio cid={} turn={} cutoff_turn_seq={}",
                 self._cid, owner, self._playback_cutoff,

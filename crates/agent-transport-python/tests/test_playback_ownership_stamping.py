@@ -206,9 +206,13 @@ class _FakeEndpoint:
 
     def __init__(self):
         self.cleared = []
+        self.rust_frames = 7
 
     def clear_buffer(self, cid):
         self.cleared.append(cid)
+
+    def queued_frames(self, cid):
+        return self.rust_frames
 
 
 def _make_output(monkeypatch):
@@ -348,3 +352,46 @@ async def test_output_transport_wiring(monkeypatch):
     stopped = BotStoppedSpeakingFrame()
     await out.push_frame(stopped, FrameDirection.UPSTREAM)
     assert "turn_id" not in stopped.metadata
+
+
+@pytest.mark.asyncio
+async def test_supersede_after_finished_cycle_is_observed_only(monkeypatch):
+    """回歸(10:54 通 SIT):播放已完整結束後的接管不得誤報 cleared ——
+    已關閉周期的保留快照只服務 Stopped 成對幀蓋章,不算 sink 內容。"""
+    out, endpoint, _ = _make_output(monkeypatch)
+    await out.process_frame(_audio("ctx-1", "turn-1"), FrameDirection.DOWNSTREAM)
+    await out.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+    started = BotStartedSpeakingFrame()
+    await out.push_frame(started, FrameDirection.UPSTREAM)
+    await out.push_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+    assert started.metadata["turn_id"] == "turn-1"
+
+    await out.process_frame(_supersede(2), FrameDirection.DOWNSTREAM)
+    assert endpoint.cleared == []                    # 空 sink:僅 observed,不清
+
+    await out.process_frame(_audio("ctx-2", "turn-2"), FrameDirection.DOWNSTREAM)
+    owned = BotStartedSpeakingFrame()
+    await out.push_frame(owned, FrameDirection.UPSTREAM)
+    assert owned.metadata["turn_id"] == "turn-2"     # 對位不受影響
+
+
+@pytest.mark.asyncio
+async def test_supersede_cuts_active_playback_keeps_displaced_identity(monkeypatch):
+    """切斷播放中音頻:清緩衝,但被切斷的周期以自身身份閉合
+    (displaced identity),新輪次身份不受污染。"""
+    out, endpoint, _ = _make_output(monkeypatch)
+    await out.process_frame(_audio("ctx-1", "turn-1"), FrameDirection.DOWNSTREAM)
+    started = BotStartedSpeakingFrame()
+    await out.push_frame(started, FrameDirection.UPSTREAM)   # 周期開啟=播放中
+
+    await out.process_frame(_supersede(2), FrameDirection.DOWNSTREAM)
+    assert endpoint.cleared == ["sid-1"]
+
+    stopped = BotStoppedSpeakingFrame()
+    await out.push_frame(stopped, FrameDirection.UPSTREAM)
+    assert stopped.metadata["turn_id"] == "turn-1"   # 被切斷者以自身身份閉合
+
+    await out.process_frame(_audio("ctx-2", "turn-2"), FrameDirection.DOWNSTREAM)
+    owned = BotStartedSpeakingFrame()
+    await out.push_frame(owned, FrameDirection.UPSTREAM)
+    assert owned.metadata["turn_id"] == "turn-2"
