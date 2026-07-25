@@ -54,6 +54,39 @@ except ImportError:
 # ─── Playback ownership ─────────────────────────────────────────────────────
 
 
+def _turn_seq(turn_id: object) -> Optional[int]:
+    """canonical turn_id 形如 ``turn-<n>``;不可解析視為無主,永不作廢。"""
+    text = str(turn_id or "")
+    if text.startswith("turn-") and text[5:].isdigit():
+        return int(text[5:])
+    return None
+
+
+def _owned_seq(metadata: dict) -> Optional[int]:
+    """音頻幀的輪次序號:優先 xbot mixin 蓋的數字 ``turn_seq``,
+    回退解析 ``turn_id``;兩者皆無 = 無主,永不作廢。"""
+    seq = metadata.get("turn_seq")
+    if isinstance(seq, int) and seq > 0:
+        return seq
+    return _turn_seq(metadata.get("turn_id"))
+
+
+# DLG-030 播放接管契約(xbot 側發射,見 xbot.vendor.tts_ownership 的
+# PlaybackSupersedeFrame):互通面是 metadata,不依賴跨倉類同一性 ——
+# 信號幀 metadata 攜帶 ``playback_control_version`` / ``new_turn_seq`` /
+# ``cutoff_turn_seq``,SystemFrame 帶外傳播(不排在要作廢的音頻後面)。
+# 序號 <= cutoff 的有主音頻失去播放權。
+#
+# 職責邊界(實測釘死):MediaSender 切塊會重建幀、丟棄 metadata(pipecat
+# base_output ``handle_audio_frame``),Rust sink 容量僅 ~400ms
+# (audio_buffer capacity = 2×200ms 閾值)——已在 MediaSender 隊列裡的
+# 陳舊大頭無身份可辨,其取消(TTS context 取消 + 打斷機制沖刷 + 分級
+# 停止策略)屬 xbot 側職責。傳輸側做最後一英里:丟棄後續到達的失權
+# 音頻(含 DLG-029 記錄的 clear/cancel 縫隙漏網幀)+ 條件清 Rust 尾巴。
+_PLAYBACK_CONTROL_VERSION_KEY = "playback_control_version"
+_PLAYBACK_CUTOFF_KEY = "cutoff_turn_seq"
+
+
 class PlaybackOwnershipStamper:
     """把 TTS 音頻幀攜帶的所有權按播放周期復制到 BotStarted/BotStopped。
 
@@ -81,7 +114,7 @@ class PlaybackOwnershipStamper:
       同步。寧可缺身份,不可錯身份。
     """
 
-    _KEYS = ("audio_ownership_version", "context_id", "turn_id")
+    _KEYS = ("audio_ownership_version", "context_id", "turn_id", "turn_seq")
     _MAX_PENDING = 8
 
     def __init__(self) -> None:
@@ -128,6 +161,20 @@ class PlaybackOwnershipStamper:
         self._cycle_open = False
         self._arrival_run_open = False
         self._poisoned = False
+
+    def has_owned_at_or_below(self, cutoff_seq: int) -> bool:
+        """sink 已知內容(當前周期或待播快照)是否含序號 <= cutoff 的音頻。
+
+        無主快照(開場白/結束語/佔位)序號不可解析,永遠回 False —— 系統
+        播報不因輪次接管被誤清。"""
+        snapshots = list(self._pending)
+        if self._cycle:
+            snapshots.append(self._cycle)
+        for snapshot in snapshots:
+            seq = _owned_seq(snapshot)
+            if seq is not None and seq <= cutoff_seq:
+                return True
+        return False
 
     def stamp(self, frame: Frame) -> None:
         if isinstance(frame, BotStartedSpeakingFrame):
@@ -399,6 +446,10 @@ class SipOutputTransport(BaseOutputTransport):
         self._started = False
         # 播放邊界所有權復制(xbot DLG-029 契約的傳輸側半邊)。
         self._playback_ownership = PlaybackOwnershipStamper()
+        # 輪次接管(DLG-030):序號 <= cutoff 的有主音頻失去播放權。單調
+        # 遞增,跨打斷保留 —— canonical 序號是通話級的。-1 = 從未收到信號。
+        self._playback_cutoff = -1
+        self._supersede_dropped: set = set()
         # FfiQueue lives on self._transport — InputTransport pumps,
         # OutputTransport subscribes per-frame. Imported here to avoid
         # circular imports during module-load time.
@@ -554,15 +605,22 @@ class SipOutputTransport(BaseOutputTransport):
         idempotent on terminated sessions (the 0.2.0 Terminated lifecycle
         short-circuits), so no defensive try/except is needed.
         """
+        metadata = getattr(frame, "metadata", None) or {}
         if isinstance(frame, InterruptionFrame):
             self._ep.clear_buffer(self._cid)
             # 被沖掉的音頻不會再播:待播所有權快照與 Rust 緩衝同步清空,
             # 否則殘留身份會錯配到下一次播放事件。
             self._playback_ownership.observe_interruption()
+            self._supersede_dropped.clear()
+        elif metadata.get(_PLAYBACK_CONTROL_VERSION_KEY) is not None:
+            self._apply_supersede(metadata)
         elif (
             isinstance(frame, TTSAudioRawFrame)
             and direction == FrameDirection.DOWNSTREAM
         ):
+            if self._is_superseded_audio(metadata):
+                # 失權輪次音頻:不入 MediaSender、不登記所有權、不播放。
+                return
             self._playback_ownership.observe_audio_frame(frame)
         elif (
             isinstance(frame, TTSStoppedFrame)
@@ -570,6 +628,47 @@ class SipOutputTransport(BaseOutputTransport):
         ):
             self._playback_ownership.observe_stop_frame()
         await super().process_frame(frame, direction)
+
+    def _apply_supersede(self, control: dict) -> None:
+        """消費輪次接管信號(xbot DLG-030 契約的傳輸側半邊)。
+
+        按 metadata 契約消費(playback_control_version / cutoff_turn_seq),
+        不依賴跨倉類同一性。僅當 sink 已知內容確含失權輪次的有主音頻時
+        才清 Rust 緩衝並整體重置所有權狀態 —— 清後仍從 MediaSender 滲出
+        的無身份殘餘退化為無主播放並被計量排除(缺身份勝於錯身份);
+        無主系統播報(開場白/結束語)不受接管影響。cutoff 單調:遲到或
+        重復的信號是空操作。發射側每輪接管必發,選擇性由本側保證。"""
+        try:
+            cutoff = int(control.get(_PLAYBACK_CUTOFF_KEY))
+        except (TypeError, ValueError):
+            return
+        if cutoff <= self._playback_cutoff:
+            return
+        self._playback_cutoff = cutoff
+        if self._playback_ownership.has_owned_at_or_below(cutoff):
+            self._ep.clear_buffer(self._cid)
+            self._playback_ownership.observe_interruption()
+            logger.info(
+                "[Supersede] stale playback cleared cid={} cutoff_turn_seq={}",
+                self._cid, cutoff,
+            )
+
+    def _is_superseded_audio(self, metadata: dict) -> bool:
+        if self._playback_cutoff < 0:
+            return False
+        if metadata.get("audio_ownership_version") is None:
+            return False
+        seq = _owned_seq(metadata)
+        if seq is None or seq > self._playback_cutoff:
+            return False
+        owner = str(metadata.get("turn_id") or f"seq-{seq}")
+        if owner not in self._supersede_dropped:
+            self._supersede_dropped.add(owner)
+            logger.info(
+                "[Supersede] dropping stale audio cid={} turn={} cutoff_turn_seq={}",
+                self._cid, owner, self._playback_cutoff,
+            )
+        return True
 
     async def push_frame(
         self,

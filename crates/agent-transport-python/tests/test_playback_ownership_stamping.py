@@ -18,10 +18,25 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
+from pipecat.frames.frames import SystemFrame
+
 from agent_transport.sip.pipecat.sip_transport import (
     PlaybackOwnershipStamper,
     SipOutputTransport,
 )
+
+
+def _supersede(new_seq: int):
+    """複刻 xbot.vendor.tts_ownership.PlaybackSupersedeFrame 的 metadata
+    契約 —— 互通面就是 metadata,傳輸側不依賴類同一性。"""
+    frame = SystemFrame()
+    frame.metadata.update({
+        "playback_control_version": 1,
+        "new_turn_id": f"turn-{new_seq}",
+        "new_turn_seq": new_seq,
+        "cutoff_turn_seq": new_seq - 1,
+    })
+    return frame
 
 
 def _audio(context_id: str, turn_id: str = "", *, versioned: bool = True):
@@ -194,6 +209,107 @@ class _FakeEndpoint:
 
     def clear_buffer(self, cid):
         self.cleared.append(cid)
+
+
+def _make_output(monkeypatch):
+    base_process = AsyncMock()
+    monkeypatch.setattr(
+        "pipecat.transports.base_output.BaseOutputTransport.process_frame",
+        base_process,
+    )
+    monkeypatch.setattr(
+        "pipecat.transports.base_output.BaseOutputTransport.push_frame",
+        AsyncMock(),
+    )
+    endpoint = _FakeEndpoint()
+    out = SipOutputTransport(endpoint, "sid-1", transport=None)
+    return out, endpoint, base_process
+
+
+# ─── DLG-030 輪次接管(supersede)傳輸側 ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_supersede_gate_drops_stale_keeps_fresh_and_unowned(monkeypatch):
+    """接管後:陳舊有主音頻被丟棄(不入 MediaSender、不登記),新輪次
+    與無章音頻照常通行。"""
+    out, endpoint, base_process = _make_output(monkeypatch)
+    await out.process_frame(
+        _supersede(4), FrameDirection.DOWNSTREAM
+    )
+
+    stale = _audio("ctx-3", "turn-3")
+    await out.process_frame(stale, FrameDirection.DOWNSTREAM)
+    fresh = _audio("ctx-4", "turn-4")
+    await out.process_frame(fresh, FrameDirection.DOWNSTREAM)
+    bare = _audio("bypass", versioned=False)
+    await out.process_frame(bare, FrameDirection.DOWNSTREAM)
+
+    forwarded = [call.args[0] for call in base_process.call_args_list]
+    assert stale not in forwarded
+    assert fresh in forwarded and bare in forwarded
+
+    started = BotStartedSpeakingFrame()
+    await out.push_frame(started, FrameDirection.UPSTREAM)
+    assert started.metadata["turn_id"] == "turn-4"   # 陳舊幀未登記,對位不偏移
+
+
+@pytest.mark.asyncio
+async def test_supersede_clears_sink_only_with_stale_owned_content(monkeypatch):
+    """sink 持有陳舊輪次音頻才清緩衝;僅無主播報(開場白)在放時不清。"""
+    out, endpoint, _ = _make_output(monkeypatch)
+    await out.process_frame(_audio("greeting-ctx"), FrameDirection.DOWNSTREAM)
+    await out.process_frame(
+        _supersede(1), FrameDirection.DOWNSTREAM
+    )
+    assert endpoint.cleared == []                    # 無主內容不受接管影響
+
+    await out.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+    await out.process_frame(_audio("ctx-3", "turn-3"), FrameDirection.DOWNSTREAM)
+    await out.process_frame(
+        _supersede(4), FrameDirection.DOWNSTREAM
+    )
+    assert endpoint.cleared == ["sid-1"]             # 陳舊有主內容:清尾巴
+
+
+@pytest.mark.asyncio
+async def test_supersede_monotonic_late_signal_noop(monkeypatch):
+    out, endpoint, _ = _make_output(monkeypatch)
+    await out.process_frame(_audio("ctx-3", "turn-3"), FrameDirection.DOWNSTREAM)
+    await out.process_frame(
+        _supersede(4), FrameDirection.DOWNSTREAM
+    )
+    await out.process_frame(
+        _supersede(3), FrameDirection.DOWNSTREAM
+    )
+    assert endpoint.cleared == ["sid-1"]             # 遲到信號不二次清
+
+    stale = _audio("ctx-3", "turn-3")
+    await out.process_frame(stale, FrameDirection.DOWNSTREAM)
+    started = BotStartedSpeakingFrame()
+    await out.push_frame(started, FrameDirection.UPSTREAM)
+    assert "turn_id" not in started.metadata         # 權威序保持 4,turn-3 仍被擋
+
+
+@pytest.mark.asyncio
+async def test_supersede_residual_playback_degrades_to_unowned(monkeypatch):
+    """清後仍從 MediaSender 滲出的陳舊殘餘:播放事件無主、被計量排除,
+    絕不錯配到新輪次(缺身份勝於錯身份)。"""
+    out, endpoint, _ = _make_output(monkeypatch)
+    await out.process_frame(_audio("ctx-3", "turn-3"), FrameDirection.DOWNSTREAM)
+    await out.process_frame(
+        _supersede(4), FrameDirection.DOWNSTREAM
+    )
+
+    residual_started = BotStartedSpeakingFrame()     # 殘餘音頻觸發的播放事件
+    await out.push_frame(residual_started, FrameDirection.UPSTREAM)
+    assert "turn_id" not in residual_started.metadata
+    await out.push_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+
+    await out.process_frame(_audio("ctx-4", "turn-4"), FrameDirection.DOWNSTREAM)
+    owned = BotStartedSpeakingFrame()
+    await out.push_frame(owned, FrameDirection.UPSTREAM)
+    assert owned.metadata["turn_id"] == "turn-4"     # 新輪次身份不被殘餘污染
 
 
 @pytest.mark.asyncio
